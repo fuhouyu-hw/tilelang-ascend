@@ -134,9 +134,9 @@ def run_test_cube_matmul_tail(M, N, K, block_M, block_N, K_L1, target):
 # (M, N, K, block_M, block_N, K_L1) - every dim deliberately non-divisible.
 cube_tail_configs = [
     (32 * 3 + 30, 32 * 2 + 16, 32 * 4 + 31, 32, 32, 32),  # (126, 80, 159)
-    (64 * 8 + 45, 64 * 8, 64 * 8 + 27, 64, 64, 64),       # (557, 512, 539) - N exact
-    (128 * 4, 128 * 4 + 99, 128 * 4, 128, 128, 128),      # (512, 611, 512) - only N tail
-    (1024 + 118, 1024 + 206, 1024 + 55, 128, 256, 64),    # (1142, 1230, 1079)
+    (64 * 8 + 45, 64 * 8, 64 * 8 + 27, 64, 64, 64),  # (557, 512, 539) - N exact
+    (128 * 4, 128 * 4 + 99, 128 * 4, 128, 128, 128),  # (512, 611, 512) - only N tail
+    (1024 + 118, 1024 + 206, 1024 + 55, 128, 256, 64),  # (1142, 1230, 1079)
 ]
 
 
@@ -244,8 +244,8 @@ def run_test_vec_abs_tail(M, N, block_M, block_N, dtype, target):
 # compiler in OptimizeForTarget -- keep tiles <= 64x128 here.
 vec_tail_configs = [
     (32 * 2 + 13, 32 * 3 + 7, 32, 32),  # (77, 103)  - 32x32  x3 fp32 = 12KB
-    (64 * 2 + 2, 64 + 36, 64, 64),      # (130, 100) - 64x64  x3 fp32 = 48KB
-    (64 * 3 + 8, 128 + 22, 64, 128),    # (200, 150) - 64x128 x3 fp32 = 96KB
+    (64 * 2 + 2, 64 + 36, 64, 64),  # (130, 100) - 64x64  x3 fp32 = 48KB
+    (64 * 3 + 8, 128 + 22, 64, 128),  # (200, 150) - 64x128 x3 fp32 = 96KB
 ]
 
 
@@ -313,8 +313,8 @@ def run_test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target):
 # (rows_valid, rows_phys, cols): rows_valid < rows_phys is the row tail that
 # real_shape must exclude from the dim=0 reduce.
 reduce_tail_configs = [
-    (3, 5, 8),       # mirrors example_col_reduce_max_slice_buffer.py exactly
-    (30, 32, 64),    # 32-row tile, 30 valid (tail 2)
+    (3, 5, 8),  # mirrors example_col_reduce_max_slice_buffer.py exactly
+    (30, 32, 64),  # 32-row tile, 30 valid (tail 2)
     (100, 128, 96),  # 128-row tile, 100 valid (tail 28)
 ]
 
@@ -409,7 +409,7 @@ def run_test_cv_matmul_add_tail(M, N, K, block_M, block_N, block_K, target):
 
 # (M, N, K, block_M, block_N, block_K) - M/N/K non-divisible.
 cv_tail_configs = [
-    (128 + 30, 256 + 16, 64 + 8, 128, 256, 64),   # (158, 272, 72)
+    (128 + 30, 256 + 16, 64 + 8, 128, 256, 64),  # (158, 272, 72)
     (256 + 33, 256 + 40, 128 + 5, 128, 256, 64),  # (289, 296, 133)
 ]
 
