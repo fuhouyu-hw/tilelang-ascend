@@ -30,26 +30,23 @@ where ``shape`` is the GM tensor's real dim and ``off`` is the tile offset
     VECTOR : gm2ub (load)       + ub2gm  (store)     -> M / N tails
     CV     : C-scope uses the cube path, V-scope the vector path
 
-pad_value (the subtle VECTOR case)
-----------------------------------
-On ``gm2ub`` loads the UB area outside ``validRow x validCol`` is filled with
-``pad_value`` (``T.copy(..., pad_value=...)``; default 0 -- ascend.cc:58 /
-copy.py:277). Correctness impact:
+pad_value vs real_shape (the subtle VECTOR case)
+------------------------------------------------
+On ``gm2ub`` loads the UB area outside ``validRow x validCol`` *can* be filled
+with ``pad_value`` (``T.copy(..., pad_value=...)``; default 0 -- ascend.cc:58 /
+copy.py:277), but this is backend-dependent and NOT reliable as a correctness
+mechanism: the PTO backend emits ``PadValue::Null`` for sliced loads
+(codegen_ascend_pto.cc), so the tail region stays *garbage*. Impact:
 
-    * element-wise (add/abs/...) : pad is computed but NOT stored back
+    * element-wise (add/abs/...) : the tail is computed but NOT stored back
       (ub2gm re-clamps the store) -> pad_value is irrelevant, default 0 is fine.
-    * reduce sum                 : pad must be 0   (default already correct).
-    * reduce max                 : pad must be -inf (default 0 is WRONG on
-      all-negative data).
-    * reduce min                 : pad must be +inf (default 0 is WRONG on
-      all-positive data).
     * CUBE gemm K-tail           : the L1 tail is implicitly 0, and 0 * B = 0,
-      so the matmul stays correct with the default.
-
-``reduce`` additionally accepts ``real_shape=[M, N]`` (reduce_ascend.py) as an
-alternative to pad_value: it tells the reduce the true valid extent so it never
-touches the pad region. This suite guards the ``pad_value`` path; the
-``test_reduce_max_tail`` case fails if pad_value plumbing regresses.
+      so the matmul stays correct.
+    * reduce                     : the tail WOULD corrupt the result, so the
+      reduce must be told its logical valid extent via ``real_shape=[rows, cols]``
+      (reduce_ascend.py) and never reads the tail at all. Relying on a -inf
+      pad instead produces inf/nan on NPU (verified) because PTO does not pad
+      sliced loads. ``test_reduce_max_tail`` guards the ``real_shape`` path.
 
 NOTE: these cases execute on real NPU hardware (``.npu()``); they cannot run in a
 CPU-only environment. Risk levels are annotated per group so unsupported
@@ -267,65 +264,66 @@ def test_vec_abs_tail(M, N, block_M, block_N, dtype, target):
 
 
 # =============================================================================
-# Group 2c - VECTOR reduce_max tail + pad_value   [risk: medium]
-# THE pad_value guard. block_N >= N, so the N tail lands in the padded region of
-# a single UB tile. Data is all-negative, so a wrong pad (default 0) would win
-# the max and break the assertion -- this is what catches a pad_value regression.
-# Mirrors examples/softmax/example_online_softmax.py (pad_value=-T.infinity +
-# reduce_max).
+# Group 2c - VECTOR reduce over a sliced/tail UB tile   [risk: medium]
+# The tail along the *reduced* dimension is handled by real_shape, NOT pad_value.
+# A physically (rows_phys, cols) tile holds only rows_valid (< rows_phys) rows of
+# real data; real_shape=[rows_valid, cols] tells the reduce its logical valid
+# extent so the [rows_valid, rows_phys) tail rows are never touched. pad_value is
+# the wrong tool here -- the PTO backend emits PadValue::Null for sliced gm2ub
+# loads (codegen_ascend_pto.cc), leaving the tail region as garbage, so a
+# full-tile reduce that relied on a -inf pad produced inf/nan on every backend.
+# Mirrors examples/reduce/example_col_reduce_max_slice_buffer.py (known-good on pto).
 # =============================================================================
-def reduce_max_tail(M, N, block_M, block_N, dtype="float16"):
-    m_num = T.ceildiv(M, block_M)
-
+def reduce_max_tail(rows_valid, rows_phys, cols, dtype="float"):
     @T.prim_func
     def main(
-        A: T.Tensor((M, N), dtype),  # type: ignore
-        B: T.Tensor((M, 1), dtype),  # type: ignore
+        Input: T.Tensor((rows_phys, cols), dtype),  # type: ignore
+        Output: T.Tensor((1, cols), dtype),  # type: ignore
     ):
-        with T.Kernel(m_num, is_npu=True) as (cid, _):
-            bx = cid
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            in_ub = T.alloc_ub((rows_phys, cols), dtype)
+            out_ub = T.alloc_ub((1, cols), dtype)
 
-            a_ub = T.alloc_ub((block_M, block_N), dtype)
-            b_ub = T.alloc_ub((block_M, 1), dtype)
-
-            # Over-extends to block_N (> N): the [N, block_N) columns are filled
-            # with -inf so they cannot win the row max.
-            T.copy(A[bx * block_M, 0], a_ub, pad_value=-T.infinity(dtype))
-            T.reduce_max(a_ub, b_ub, dim=-1)
-            T.copy(b_ub, B[bx * block_M, 0])  # ub2gm: M tail clamp
+            if vid == 0:
+                T.copy(Input, in_ub)
+                # Reduce dim=0 over only the first rows_valid rows; the
+                # [rows_valid, rows_phys) tail rows are excluded via real_shape.
+                T.reduce_max(in_ub, out_ub, dim=0, real_shape=[rows_valid, cols])
+                T.copy(out_ub, Output)
 
     return main
 
 
-def run_test_reduce_max_tail(M, N, block_M, block_N, dtype, target):
+def run_test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target):
     torch.manual_seed(0)
-    func = reduce_max_tail(M, N, block_M, block_N, dtype)
+    func = reduce_max_tail(rows_valid, rows_phys, cols, dtype)
     func = tilelang.compile(func, out_idx=[-1], pass_configs=VEC_PASS_CONFIGS, target=target)
 
     td = _torch_dtype(dtype)
-    # All-negative input: a correct -inf pad keeps the row max negative, a wrong
-    # 0 pad would report 0.
-    a = (-torch.rand(M, N, dtype=td) - 0.5).npu()
+    a = torch.randn(rows_phys, cols, dtype=td).npu()
 
     torch.npu.synchronize()
-    b = func(a)
+    out = func(a)
 
-    ref_b = a.max(dim=1, keepdim=True).values
-    torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
+    # Only the first rows_valid rows are logically valid.
+    ref = torch.max(a[:rows_valid, :], dim=0, keepdim=True).values
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
-# (M, N, block_M, block_N) with block_N >= N so the N tail becomes pad columns.
+# (rows_valid, rows_phys, cols): rows_valid < rows_phys is the row tail that
+# real_shape must exclude from the dim=0 reduce.
 reduce_tail_configs = [
-    (32 * 3 + 30, 200, 32, 256),  # (126, 200): M tail + 56 pad cols
-    (64 * 4 + 7, 100, 64, 128),   # (263, 100): M tail + 28 pad cols
+    (3, 5, 8),       # mirrors example_col_reduce_max_slice_buffer.py exactly
+    (30, 32, 64),    # 32-row tile, 30 valid (tail 2)
+    (100, 128, 96),  # 128-row tile, 100 valid (tail 28)
 ]
 
 
-@pytest.mark.parametrize("dtype", ["float16", "float"])
+@pytest.mark.parametrize("dtype", ["float"])
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
-@pytest.mark.parametrize("M,N,block_M,block_N", reduce_tail_configs)
-def test_reduce_max_tail(M, N, block_M, block_N, dtype, target):
-    run_test_reduce_max_tail(M, N, block_M, block_N, dtype, target=target)
+@pytest.mark.parametrize("rows_valid,rows_phys,cols", reduce_tail_configs)
+def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target):
+    run_test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target=target)
 
 
 # =============================================================================
