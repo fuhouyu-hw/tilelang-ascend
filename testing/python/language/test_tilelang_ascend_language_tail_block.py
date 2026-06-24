@@ -239,10 +239,16 @@ def run_test_vec_abs_tail(M, N, block_M, block_N, dtype, target):
 
 
 # (M, N, block_M, block_N) - both dims non-divisible.
+# Tiles are kept small enough that 3x full-block UB buffers stay within the
+# Unified Buffer: this group uses NO VEC_NUM split (one AIV handles the whole
+# block_M), so the footprint is block_M*block_N*sizeof(dtype)*3. 64x128 fp32 x3
+# = 96KB is comfortably under budget. The earlier 128x128 (192KB) / 128x256
+# (384KB) fp32 full-block configs over-allocated UB and segfaulted the AscendC
+# compiler in OptimizeForTarget -- keep tiles <= 64x128 here.
 vec_tail_configs = [
-    (32 * 2 + 13, 32 * 3 + 7, 32, 32),       # (77, 103)
-    (128 * 3 + 30, 128 * 2 + 50, 128, 128),  # (414, 306)
-    (256 + 5, 512 + 11, 128, 256),           # (261, 523)
+    (32 * 2 + 13, 32 * 3 + 7, 32, 32),  # (77, 103)  - 32x32  x3 fp32 = 12KB
+    (64 * 2 + 2, 64 + 36, 64, 64),      # (130, 100) - 64x64  x3 fp32 = 48KB
+    (64 * 3 + 8, 128 + 22, 64, 128),    # (200, 150) - 64x128 x3 fp32 = 96KB
 ]
 
 
