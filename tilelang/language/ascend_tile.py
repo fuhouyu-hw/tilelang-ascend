@@ -8,6 +8,15 @@ import functools
 import warnings
 
 import math
+from functools import reduce
+import operator
+
+
+def _prod(extent):
+    """Product of a list of extents. Unlike ``math.prod``, this supports
+    PrimExpr elements (e.g. a runtime-dynamic slice extent) by using the
+    ``*`` operator, which TVM overloads on PrimExpr."""
+    return reduce(operator.mul, extent, 1)
 
 
 def deprecated(message=None):
@@ -64,7 +73,7 @@ def _handle_buffer_region(br: BufferRegion, mask):
     indices = [x.min for x in br.region]
     offset = bf.offset_of(indices)[0]
     extent = [x.extent for x in br.region]
-    size_extent = math.prod(extent)
+    size_extent = _prod(extent)
     return bf.access_ptr(mask, offset=offset, extent=size_extent), extent
 
 
@@ -230,10 +239,10 @@ def fill(buffer: Buffer | BufferRegion, value: PrimExpr):
     """
     if isinstance(buffer, BufferRegion):
         buffer_ptr, buffer_extent = _handle_buffer_region(buffer, "w")
-        size = math.prod(buffer_extent)
+        size = _prod(buffer_extent)
     else:
         buffer_ptr = buffer.access_ptr("w")
-        size = math.prod(buffer.shape)
+        size = _prod(buffer.shape)
 
     return tir.call_intrin(
         "handle",

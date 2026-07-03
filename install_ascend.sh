@@ -173,6 +173,27 @@ echo "Cloning TVM repository and initializing submodules..."
 # clone and build tvm
 git submodule update --init --recursive
 
+# Apply local patches on top of the tvm submodule (e.g. dynamic-slice fix
+# for Buffer.__getitem__ has_step check, see tvm_slice_step_fix.patch).
+# Idempotent: a patch is skipped if the target tree already contains the
+# change (detected by reverse-applying --check).
+PATCH_DIR="$(dirname "$(readlink -f "$0")")"
+for patch in "$PATCH_DIR"/*.patch; do
+    [ -e "$patch" ] || continue
+    patch_name=$(basename "$patch")
+    case "$patch_name" in
+        tvm_*.patch)
+            echo "Applying tvm submodule patch: $patch_name"
+            (cd 3rdparty/tvm \
+                && git apply --reverse --check "$patch" 2>/dev/null \
+                && echo "  $patch_name skipped (already applied)" \
+                || (git apply --check "$patch" 2>/dev/null && git apply "$patch" \
+                    && echo "  $patch_name applied" \
+                    || echo "  $patch_name FAILED to apply"))
+            ;;
+    esac
+done
+
 # 根据增量编译选项决定是否清理 build 目录
 if $INCREMENTAL_BUILD; then
     if [ -d build ]; then
