@@ -279,6 +279,59 @@ def test_vec_abs_tail(M, N, block_M, block_N, dtype, target, tail_mask):
 
 
 # =============================================================================
+# Group 2b-2 - VECTOR scalar-immediate tail   [risk: low]
+# `T.tile.add(dst, src, imm)` lowers to `adds` -> tail_scalar. Same per-lane
+# story as add/abs (pad_value irrelevant, ub2gm re-clamps). This closes the
+# scalar coverage gap so unary/binary/scalar are all numerically guarded on both
+# backends (ascendc + pto) x tail_mask={False,True}.
+# =============================================================================
+def vec_scalar_tail(M, N, block_M, block_N, dtype="float"):
+    m_num = T.ceildiv(M, block_M)
+    n_num = T.ceildiv(N, block_N)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),  # type: ignore
+        B: T.Tensor((M, N), dtype),  # type: ignore
+    ):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+            bx = cid // n_num
+            by = cid % n_num
+
+            a_ub = T.alloc_ub((block_M, block_N), dtype)
+            b_ub = T.alloc_ub((block_M, block_N), dtype)
+
+            T.copy(A[bx * block_M, by * block_N], a_ub)  # gm2ub: M & N tail
+            T.tile.add(b_ub, a_ub, 2.0)  # scalar immediate -> adds -> tail_scalar
+            T.copy(b_ub, B[bx * block_M, by * block_N])  # ub2gm: M & N tail
+
+    return main
+
+
+def run_test_vec_scalar_tail(M, N, block_M, block_N, dtype, target, tail_mask):
+    torch.manual_seed(0)
+    func = vec_scalar_tail(M, N, block_M, block_N, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=_vec_configs(tail_mask), target=target)
+
+    td = _torch_dtype(dtype)
+    a = torch.randn(M, N, dtype=td).npu()
+
+    torch.npu.synchronize()
+    b = func(a)
+
+    ref_b = a + 2.0
+    torch.testing.assert_close(b, ref_b, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("tail_mask", [False, True])
+@pytest.mark.parametrize("dtype", ["float", "float16"])
+@pytest.mark.parametrize("target", ["ascendc", "pto"])
+@pytest.mark.parametrize("M,N,block_M,block_N", vec_tail_configs)
+def test_vec_scalar_tail(M, N, block_M, block_N, dtype, target, tail_mask):
+    run_test_vec_scalar_tail(M, N, block_M, block_N, dtype, target=target, tail_mask=tail_mask)
+
+
+# =============================================================================
 # Group 2c - VECTOR reduce over a sliced/tail UB tile   [risk: medium]
 # The tail along the *reduced* dimension is handled by real_shape, NOT pad_value.
 # A physically (rows_phys, cols) tile holds only rows_valid (< rows_phys) rows of
