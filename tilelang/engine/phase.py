@@ -68,14 +68,16 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.CollectBufferShapes()(mod)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
-    # Propagate UB tail valid-regions and rewrite unary/binary/scalar ops to
-    # tail-aware variants (must run before passes that reorder copy/vector ops).
-    # The pass self-gates on TL_ASCEND_TAIL_MASK (default off) and is a no-op
-    # otherwise, so non-tail kernels are unaffected. Reduce is NOT rewritten for
-    # now (the tail_reduce ReduceSum<AR> path has an output-layout bug); it stays
-    # on the full-tile + pad_value path, revisited in batch 2 with
-    # compare/select/broadcast tail support.
-    mod = tilelang.transform.AscendTailMaskPropagation(rewrite_reduce=False)(mod)
+    # Propagate UB tail valid-regions and rewrite unary/binary/scalar/reduce ops
+    # to tail-aware variants (must run before passes that reorder copy/vector
+    # ops). The pass self-gates on TL_ASCEND_TAIL_MASK (default off) and is a
+    # no-op otherwise, so non-tail kernels are unaffected. Reduce is rewritten to
+    # a valid-region tail_reduce only on the AscendC backend (which has the
+    # TailReduceOpCodegen + tail_reduce_* device helpers); PTO has no tail_reduce
+    # codegen and keeps its native real_shape reduce over the pad-filled tile, so
+    # reduce rewrite is disabled there.
+    rewrite_reduce = target.model in ("ascendc", "auto")
+    mod = tilelang.transform.AscendTailMaskPropagation(rewrite_reduce=rewrite_reduce)(mod)
     # Erase manual workspace allocations for virtual CV copy in Ascend
     mod = tilelang.transform.AscendWorkspaceReduction()(mod)
     # Legalize vectorized loops to ensure they are valid

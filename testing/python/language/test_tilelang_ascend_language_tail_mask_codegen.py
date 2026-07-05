@@ -163,12 +163,16 @@ def test_tail_scalar_emits_tail_helper(target):
 
 
 @pytest.mark.parametrize("target", ["ascendc", "pto"])
-def test_tail_reduce_not_rewritten(target):
-    # reduce is currently NOT rewritten to a tail variant (rewrite_reduce=False):
-    # it stays on the full-tile + pad_value/real_shape path, so neither backend
-    # emits its tail marker for a reduce-only kernel.
+def test_tail_reduce_rewritten_only_on_ascendc(target):
+    # reduce is rewritten to a valid-region tail_reduce ONLY on ascendc (which
+    # has the tail_reduce_* device helpers + TailReduceOpCodegen). PTO has no
+    # tail_reduce codegen and keeps its native real_shape reduce, so a
+    # reduce-only kernel emits no DYNAMIC tail tile there.
     src = _source(_tail_reduce(34, 130, 32, 32, "float"), target=target)
-    assert _no_tail_marker(target) not in src, src
+    if target == "ascendc":
+        assert "tl::ascend::tail_reduce" in src, src
+    else:
+        assert "pto::DYNAMIC" not in src, src
 
 
 @pytest.mark.parametrize("target", ["ascendc", "pto"])

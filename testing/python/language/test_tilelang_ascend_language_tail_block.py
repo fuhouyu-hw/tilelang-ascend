@@ -398,6 +398,118 @@ def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target, tail_mask):
 
 
 # =============================================================================
+# Group 2d - VECTOR tail_reduce over a genuine tail COPY   [risk: medium]
+# Unlike Group 2c (which uses `real_shape` on a full tile), here the reduce
+# source is itself a tail: a smaller GM tensor is loaded into a bigger UB tile,
+# so the copy seeds a real tail mask. With TL_ASCEND_TAIL_MASK on, the reduce is
+# rewritten to a valid-region `tail_reduce` (AscendC only -- PTO keeps native
+# real_shape reduce and has no tail_reduce codegen, so this group is ascendc-only
+# and tail_mask=True only).
+#
+# `max` uses negative-biased data on purpose: the UB gap is pad-filled with 0, so
+# a reduce that (wrongly) folds in the gap would return ~0, while the correct
+# valid-region reduce returns the true (negative) max. That makes this a real
+# discriminator for tail_reduce, not just a smoke test.
+# =============================================================================
+def reduce_col_tail(rows, n_valid, block_N, op, dtype="float"):
+    # tile is (rows, block_N); GM A is (rows, n_valid) with n_valid < block_N ->
+    # column tail. reduce over dim=-1 -> (rows, 1), all rows valid.
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, n_valid), dtype),  # type: ignore
+        R: T.Tensor((rows, 1), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, _):
+            a_ub = T.alloc_ub((rows, block_N), dtype)
+            r_ub = T.alloc_ub((rows, 1), dtype)
+            T.copy(A[0, 0], a_ub)  # (rows, n_valid) -> (rows, block_N): col tail
+            if op == "sum":
+                T.reduce_sum(a_ub, r_ub, dim=-1)
+            else:
+                T.reduce_max(a_ub, r_ub, dim=-1)
+            T.copy(r_ub, R)
+
+    return main
+
+
+def reduce_row_tail(m_valid, block_M, cols, op, dtype="float"):
+    # tile is (block_M, cols); GM A is (m_valid, cols) with m_valid < block_M ->
+    # row tail. reduce over dim=0 -> (1, cols).
+    @T.prim_func
+    def main(
+        A: T.Tensor((m_valid, cols), dtype),  # type: ignore
+        R: T.Tensor((1, cols), dtype),  # type: ignore
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, _):
+            a_ub = T.alloc_ub((block_M, cols), dtype)
+            r_ub = T.alloc_ub((1, cols), dtype)
+            T.copy(A[0, 0], a_ub)  # (m_valid, cols) -> (block_M, cols): row tail
+            if op == "sum":
+                T.reduce_sum(a_ub, r_ub, dim=0)
+            else:
+                T.reduce_max(a_ub, r_ub, dim=0)
+            T.copy(r_ub, R)
+
+    return main
+
+
+def _reduce_input(valid_shape, op, dtype):
+    td = _torch_dtype(dtype)
+    if op == "max":
+        # negative-biased: gap (pad 0) would win a contaminated reduce.
+        return (torch.randn(*valid_shape, dtype=td) - 3.0).npu()
+    return torch.randn(*valid_shape, dtype=td).npu()
+
+
+# (rows, n_valid, block_N): n_valid < block_N is the column tail.
+reduce_col_tail_configs = [
+    (8, 13, 32),  # (8, 13) in a (8, 32) tile
+    (16, 100, 128),
+    (32, 30, 64),
+]
+
+
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize("dtype", ["float"])
+@pytest.mark.parametrize("rows,n_valid,block_N", reduce_col_tail_configs)
+def test_reduce_col_tail(rows, n_valid, block_N, dtype, op):
+    torch.manual_seed(0)
+    func = reduce_col_tail(rows, n_valid, block_N, op, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=_vec_configs(True), target="ascendc")
+
+    a = _reduce_input((rows, n_valid), op, dtype)
+    torch.npu.synchronize()
+    out = func(a)
+
+    ref = torch.sum(a, dim=1, keepdim=True) if op == "sum" else torch.max(a, dim=1, keepdim=True).values
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+# (m_valid, block_M, cols): m_valid < block_M is the row tail.
+reduce_row_tail_configs = [
+    (5, 32, 8),
+    (30, 64, 48),
+    (100, 128, 40),
+]
+
+
+@pytest.mark.parametrize("op", ["sum", "max"])
+@pytest.mark.parametrize("dtype", ["float"])
+@pytest.mark.parametrize("m_valid,block_M,cols", reduce_row_tail_configs)
+def test_reduce_row_tail(m_valid, block_M, cols, dtype, op):
+    torch.manual_seed(0)
+    func = reduce_row_tail(m_valid, block_M, cols, op, dtype)
+    func = tilelang.compile(func, out_idx=[-1], pass_configs=_vec_configs(True), target="ascendc")
+
+    a = _reduce_input((m_valid, cols), op, dtype)
+    torch.npu.synchronize()
+    out = func(a)
+
+    ref = torch.sum(a, dim=0, keepdim=True) if op == "sum" else torch.max(a, dim=0, keepdim=True).values
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+# =============================================================================
 # Group 3 - CV fusion (matmul + add) tail   [risk: medium]
 # Mirrors examples/simple_fusion/matmul_add.py, but the grid uses T.ceildiv with
 # non-divisible M/N. C-scope (cube) tails ride gm2l1/l0c2gm; V-scope (vector,
