@@ -77,6 +77,39 @@ def _tail_reduce(M, N, block_M, block_N, dtype="float"):
     return main
 
 
+def _tail_select_reduce(M, N, block_M, block_N, dtype="float"):
+    # copy(tail) -> compare -> select -> reduce. compare/select are per-lane and
+    # stay full-tile, but the pass must propagate the tail rect through select so
+    # the downstream reduce is rewritten to tail_reduce. Without PropagateSelect
+    # the reduce source is untracked and stays on the full-tile path.
+    m_num = T.ceildiv(M, block_M)
+    n_num = T.ceildiv(N, block_N)
+    mask_w = block_N // 8
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
+        R: T.Tensor((M, block_N), dtype),
+    ):
+        with T.Kernel(m_num * n_num, is_npu=True) as (cid, _):
+            bx = cid // n_num
+            by = cid % n_num
+            a_ub = T.alloc_ub((block_M, block_N), dtype)
+            b_ub = T.alloc_ub((block_M, block_N), dtype)
+            c_ub = T.alloc_ub((block_M, block_N), dtype)
+            mask_ub = T.alloc_ub((block_M, mask_w), "uint8")
+            r_ub = T.alloc_ub((block_M, 1), dtype)
+            T.copy(A[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N], a_ub)
+            T.copy(B[bx * block_M : (bx + 1) * block_M, by * block_N : (by + 1) * block_N], b_ub)
+            T.tile.compare(mask_ub, a_ub, b_ub, "GT")
+            T.tile.select(c_ub, mask_ub, a_ub, b_ub, "VSEL_TENSOR_TENSOR_MODE")
+            T.reduce_sum(c_ub, r_ub, dim=-1)
+            T.copy(r_ub, R[bx * block_M : (bx + 1) * block_M, by : by + 1])
+
+    return main
+
+
 def _tail_unary(M, N, block_M, block_N, dtype="float"):
     m_num = T.ceildiv(M, block_M)
     n_num = T.ceildiv(N, block_N)
@@ -173,6 +206,15 @@ def test_tail_reduce_rewritten_only_on_ascendc(target):
         assert "tl::ascend::tail_reduce" in src, src
     else:
         assert "pto::DYNAMIC" not in src, src
+
+
+def test_select_propagates_tail_to_reduce():
+    # ascendc + flag on: compare -> select -> reduce. The select result inherits
+    # the tail rect (PropagateSelect), so the reduce over it is rewritten to
+    # tail_reduce. This guards that the tail mask flows through select; without
+    # propagation the reduce would stay on the full-tile path (no tail_reduce).
+    src = _source(_tail_select_reduce(34, 130, 32, 32, "float"), target="ascendc")
+    assert "tl::ascend::tail_reduce" in src, src
 
 
 @pytest.mark.parametrize("target", ["ascendc", "pto"])

@@ -310,6 +310,16 @@ private:
       PropagateBroadcast(call);
       return Stmt();
     }
+    // Select: dst(0) selMask(1) src0(2) src1_type(3) src1(4) mode(5)
+    // count(6)... Per-lane (dst = selMask ? src0 : src1), so the compute stays
+    // full-tile; we only propagate the valid region to dst so a downstream
+    // reduce over the select result is tail-aware. compare is intentionally not
+    // tracked: its output is a packed bitmask, only consumed by select (which
+    // re-derives the rect from its own src0/src1), and never reduced.
+    if (call->op.same_as(ascend_select())) {
+      PropagateSelect(call);
+      return Stmt();
+    }
     return Stmt();
   }
 
@@ -318,6 +328,24 @@ private:
     const VarNode *dst_v = GetPtrVar(dst_ptr);
     if (dst_v != nullptr)
       state_[dst_v] = GetMask(GetPtrVar(src_ptr));
+  }
+
+  // dst = selMask ? src0 : src1. dst's valid rect is src0's (same tile shape),
+  // intersected with src1's when src1 is a tensor (VSEL_TENSOR_TENSOR_MODE,
+  // src1_type == 2). Scalar src1 (modes 0/1) does not constrain the rect.
+  void PropagateSelect(const CallNode *call) {
+    if (call->args.size() < 3)
+      return;
+    const VarNode *dst_v = GetPtrVar(call->args[0]);
+    if (dst_v == nullptr)
+      return;
+    TailMaskInfo m = GetMask(GetPtrVar(call->args[2]));
+    if (call->args.size() > 4) {
+      const auto *src1_type = call->args[3].as<IntImmNode>();
+      if (src1_type != nullptr && src1_type->value == 2)
+        m = IntersectMasks(m, GetMask(GetPtrVar(call->args[4])), analyzer_);
+    }
+    state_[dst_v] = m;
   }
 
   Stmt RewriteUnary(const CallNode *call, const std::string &tag) {
