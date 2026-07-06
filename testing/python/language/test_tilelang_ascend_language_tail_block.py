@@ -406,11 +406,16 @@ def test_reduce_max_tail(rows_valid, rows_phys, cols, dtype, target, tail_mask):
 # real_shape reduce and has no tail_reduce codegen, so this group is ascendc-only
 # and tail_mask=True only).
 #
-# `max` uses negative-biased data on purpose: the UB gap is pad-filled with 0, so
-# a reduce that (wrongly) folds in the gap would return ~0, while the correct
-# valid-region reduce returns the true (negative) max. That makes this a real
-# discriminator for tail_reduce, not just a smoke test.
+# The UB gap is deliberately pad-filled with a large POISON value (1e30): if
+# tail_reduce ever (wrongly) read the gap, the result would blow up (huge sum, or
+# max == 1e30), whereas the correct valid-region reduce ignores it entirely. So
+# these cases double as proof that tail_reduce needs NO pad value -- it never
+# touches the gap. (`max` also uses negative-biased data so even a plain gap-0
+# read would be caught.)
 # =============================================================================
+_POISON = 1e30  # sentinel pad: a reduce reading it anywhere is a hard failure
+
+
 def reduce_col_tail(rows, n_valid, block_N, op, dtype="float"):
     # tile is (rows, block_N); GM A is (rows, n_valid) with n_valid < block_N ->
     # column tail. reduce over dim=-1 -> (rows, 1), all rows valid.
@@ -422,7 +427,7 @@ def reduce_col_tail(rows, n_valid, block_N, op, dtype="float"):
         with T.Kernel(1, is_npu=True) as (cid, _):
             a_ub = T.alloc_ub((rows, block_N), dtype)
             r_ub = T.alloc_ub((rows, 1), dtype)
-            T.copy(A[0, 0], a_ub)  # (rows, n_valid) -> (rows, block_N): col tail
+            T.copy(A[0, 0], a_ub, pad_value=_POISON)  # col tail; gap poisoned
             if op == "sum":
                 T.reduce_sum(a_ub, r_ub, dim=-1)
             else:
@@ -443,7 +448,7 @@ def reduce_row_tail(m_valid, block_M, cols, op, dtype="float"):
         with T.Kernel(1, is_npu=True) as (cid, _):
             a_ub = T.alloc_ub((block_M, cols), dtype)
             r_ub = T.alloc_ub((1, cols), dtype)
-            T.copy(A[0, 0], a_ub)  # (m_valid, cols) -> (block_M, cols): row tail
+            T.copy(A[0, 0], a_ub, pad_value=_POISON)  # row tail; gap poisoned
             if op == "sum":
                 T.reduce_sum(a_ub, r_ub, dim=0)
             else:
